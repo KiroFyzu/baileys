@@ -1,26 +1,43 @@
 import { Boom } from '@hapi/boom'
-import NodeCache from 'node-cache'
-import makeWASocket, { AnyMessageContent, delay, DisconnectReason, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, makeCacheableSignalKeyStore, makeInMemoryStore, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
-import MAIN_LOGGER from '../src/Utils/logger'
+import NodeCache from '@cacheable/node-cache'
+import readline from 'readline'
+import makeWASocket, { AnyMessageContent, BinaryInfo, CacheStore, delay, DisconnectReason, downloadAndProcessHistorySyncNotification, encodeWAM, fetchLatestBaileysVersion, getAggregateVotesInPollMessage, getHistoryMsg, isJidNewsletter, jidDecode, makeCacheableSignalKeyStore, normalizeMessageContent, PatchedMessageWithRecipientJID, proto, useMultiFileAuthState, WAMessageContent, WAMessageKey } from '../src'
+//import MAIN_LOGGER from '../src/Utils/logger'
+import open from 'open'
+import fs from 'fs'
+import P from 'pino'
 
-const logger = MAIN_LOGGER.child({ })
+const logger = P({
+  level: "trace",
+  transport: {
+    targets: [
+      {
+        target: "pino-pretty", // pretty-print for console
+        options: { colorize: true },
+        level: "trace",
+      },
+      {
+        target: "pino/file", // raw file output
+        options: { destination: './wa-logs.txt' },
+        level: "trace",
+      },
+    ],
+  },
+})
 logger.level = 'trace'
 
-const useStore = !process.argv.includes('--no-store')
-const doReplies = !process.argv.includes('--no-reply')
+const doReplies = process.argv.includes('--do-reply')
+const usePairingCode = process.argv.includes('--use-pairing-code')
 
 // external map to store retry counts of messages when decryption/encryption fails
 // keep this out of the socket itself, so as to prevent a message decryption/encryption loop across socket restarts
-const msgRetryCounterCache = new NodeCache()
+const msgRetryCounterCache = new NodeCache() as CacheStore
 
-// the store maintains the data of the WA connection in memory
-// can be written out to a file & read from it
-const store = useStore ? makeInMemoryStore({ logger }) : undefined
-store?.readFromFile('./baileys_store_multi.json')
-// save every 10s
-setInterval(() => {
-	store?.writeToFile('./baileys_store_multi.json')
-}, 10_000)
+const onDemandMap = new Map<string, string>()
+
+// Read line interface
+const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+const question = (text: string) => new Promise<string>((resolve) => rl.question(text, resolve))
 
 // start a connection
 const startSock = async() => {
@@ -32,7 +49,6 @@ const startSock = async() => {
 	const sock = makeWASocket({
 		version,
 		logger,
-		printQRInTerminal: true,
 		auth: {
 			creds: state.creds,
 			/** caching makes the store faster to send/recv messages */
@@ -44,10 +60,17 @@ const startSock = async() => {
 		// comment the line below out
 		// shouldIgnoreJid: jid => isJidBroadcast(jid),
 		// implement to handle retries & poll updates
-		getMessage,
+		getMessage
 	})
 
-	store?.bind(sock.ev)
+
+	// Pairing code for Web clients
+	if (usePairingCode && !sock.authState.creds.registered) {
+		// todo move to QR event
+		const phoneNumber = await question('Please enter your phone number:\n')
+		const code = await sock.requestPairingCode(phoneNumber)
+		console.log(`Pairing code: ${code}`)
+	}
 
 	const sendMessageWTyping = async(msg: AnyMessageContent, jid: string) => {
 		await sock.presenceSubscribe(jid)
@@ -79,7 +102,6 @@ const startSock = async() => {
 						console.log('Connection closed. You are logged out.')
 					}
 				}
-
 				console.log('connection update', update)
 			}
 
@@ -88,31 +110,64 @@ const startSock = async() => {
 				await saveCreds()
 			}
 
+			if(events['labels.association']) {
+				console.log(events['labels.association'])
+			}
+
+
+			if(events['labels.edit']) {
+				console.log(events['labels.edit'])
+			}
+
 			if(events.call) {
 				console.log('recv call event', events.call)
 			}
 
 			// history received
 			if(events['messaging-history.set']) {
-				const { chats, contacts, messages, isLatest } = events['messaging-history.set']
-				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest})`)
+				const { chats, contacts, messages, isLatest, progress, syncType } = events['messaging-history.set']
+				if (syncType === proto.HistorySync.HistorySyncType.ON_DEMAND) {
+					console.log('received on-demand history sync, messages=', messages)
+				}
+				console.log(`recv ${chats.length} chats, ${contacts.length} contacts, ${messages.length} msgs (is latest: ${isLatest}, progress: ${progress}%), type: ${syncType}`)
 			}
 
 			// received a new message
-			if(events['messages.upsert']) {
-				const upsert = events['messages.upsert']
-				console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
+      if (events['messages.upsert']) {
+        const upsert = events['messages.upsert']
+        console.log('recv messages ', JSON.stringify(upsert, undefined, 2))
 
-				if(upsert.type === 'notify') {
-					for(const msg of upsert.messages) {
-						if(!msg.key.fromMe && doReplies) {
-							console.log('replying to', msg.key.remoteJid)
-							await sock!.readMessages([msg.key])
-							await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid!)
-						}
-					}
-				}
-			}
+        if (!!upsert.requestId) {
+          console.log("placeholder message received for request of id=" + upsert.requestId, upsert)
+        }
+
+
+
+        if (upsert.type === 'notify') {
+          for (const msg of upsert.messages) {
+            if (msg.message?.conversation || msg.message?.extendedTextMessage?.text) {
+              const text = msg.message?.conversation || msg.message?.extendedTextMessage?.text
+              if (text == "requestPlaceholder" && !upsert.requestId) {
+                const messageId = await sock.requestPlaceholderResend(msg.key)
+                console.log('requested placeholder resync, id=', messageId)
+              }
+
+              // go to an old chat and send this
+              if (text == "onDemandHistSync") {
+                const messageId = await sock.fetchMessageHistory(50, msg.key, msg.messageTimestamp!)
+                console.log('requested on-demand sync, id=', messageId)
+              }
+
+              if (!msg.key.fromMe && doReplies && !isJidNewsletter(msg.key?.remoteJid!)) {
+
+                console.log('replying to', msg.key.remoteJid)
+                await sock!.readMessages([msg.key])
+                await sendMessageWTyping({ text: 'Hello there!' }, msg.key.remoteJid!)
+              }
+            }
+          }
+        }
+      }
 
 			// messages updated like status delivered, message deleted etc.
 			if(events['messages.update']) {
@@ -122,7 +177,7 @@ const startSock = async() => {
 
 				for(const { key, update } of events['messages.update']) {
 					if(update.pollUpdates) {
-						const pollCreation = await getMessage(key)
+						const pollCreation: proto.IMessage = {} // get the poll creation message somehow
 						if(pollCreation) {
 							console.log(
 								'got poll update, aggregation: ',
@@ -174,13 +229,11 @@ const startSock = async() => {
 	return sock
 
 	async function getMessage(key: WAMessageKey): Promise<WAMessageContent | undefined> {
-		if(store) {
-			const msg = await store.loadMessage(key.remoteJid!, key.id!)
-			return msg?.message || undefined
-		}
+	  // Implement a way to retreive messages that were upserted from messages.upsert
+			// up to you
 
 		// only if store is present
-		return proto.Message.fromObject({})
+		return proto.Message.create({ conversation: 'test' })
 	}
 }
 
